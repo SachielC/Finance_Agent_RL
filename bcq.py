@@ -1,364 +1,303 @@
-import copy
-import datetime
+import gym
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-import gym
-from gym import spaces
-import yfinance as yf
-import pandas as pd
+import random
+from collections import deque, namedtuple
+import matplotlib.pyplot as plt
 
-# ------------------------
-# Custom Stock Trading Environment
-# ------------------------
-class StockTradingEnv(gym.Env):
+# --------------------------
+# Trading Environment
+# --------------------------
+class TradingEnv(gym.Env):
     """
-    A simplified stock trading environment for multiple stocks.
-    The state consists of the close price, dividend, volume, and date (as an ordinal number)
-    for each stock. The action is a continuous vector (one per stock) in [-1,1] interpreted
-    as a trading signal.
+    Trading environment where you start with $10,000 and must fully invest
+    in stocks at the first step according to an allocation vector.
+    After the initial purchase, no selling is allowed.
+    The observation consists of the current stock prices and your current holdings.
     """
-    def __init__(self, tickers, start_date, end_date, initial_cash=1e6):
-        super(StockTradingEnv, self).__init__()
-        self.tickers = tickers
-        self.data = {}
-        for ticker in tickers:
-            df = yf.Ticker(ticker).history(start=start_date, end=end_date)
-            # Make sure we have the columns we need. Rename "Dividends" to "Dividends" if needed.
-            df = df.reset_index()
-            # Convert date to ordinal (an increasing number)
-            df['Date'] = df['Date'].apply(lambda x: x.toordinal())
-            # Ensure we have 'Close', 'Dividends', and 'Volume'
-            df = df[['Date', 'Close', 'Dividends', 'Volume']]
-            self.data[ticker] = df.reset_index(drop=True)
-        
-        # For simplicity, assume all stocks have the same number of records
-        self.max_steps = min([len(df) for df in self.data.values()])
-        self.current_step = 0
-
+    def __init__(self, stock_prices, initial_cash=10000):
+        super().__init__()
+        self.stock_prices = stock_prices  # shape: (T, num_stocks)
         self.initial_cash = initial_cash
-        self.cash = initial_cash
-        # Positions: number of shares held per stock
-        self.positions = {ticker: 0.0 for ticker in self.tickers}
-
-        # Define state dimensions: for each stock we use 4 features.
-        self.observation_dim = len(self.tickers) * 4
-        self.action_dim = len(self.tickers)
-        self.action_space = spaces.Box(low=-1, high=1, shape=(self.action_dim,), dtype=np.float32)
-        # We allow any real number in the state (features will be normalized later if needed)
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.observation_dim,), dtype=np.float32)
-
-    def _get_state(self):
-        """Aggregate features for all stocks at the current step into a flat vector."""
-        features = []
-        for ticker in self.tickers:
-            df = self.data[ticker]
-            row = df.iloc[self.current_step]
-            # For each ticker we add: [close, dividend, volume, date]
-            features.extend([row['Close'], row['Dividends'], row['Volume'], row['Date']])
-        return np.array(features, dtype=np.float32)
-
-    def step(self, action):
-        """
-        Execute trades based on the action.
-        For each stock, interpret action[i] (in [-1,1]) as:
-          - positive: buy, negative: sell
-        We scale the trade size as a fraction of total portfolio value.
-        """
-        state = self._get_state()
-        # Compute current portfolio value
-        total_value = self.cash + sum(
-            self.positions[ticker] * self.data[ticker].iloc[self.current_step]['Close'] 
-            for ticker in self.tickers
-        )
-        # For each stock, compute the trade value
-        for i, ticker in enumerate(self.tickers):
-            current_price = self.data[ticker].iloc[self.current_step]['Close']
-            # Here we use a scaling factor (e.g., 10% of portfolio per action)
-            trade_value = action[i] * total_value * 0.1
-            if trade_value > 0:  # buy
-                # Buy shares if cash is available
-                if self.cash >= trade_value:
-                    shares_bought = trade_value / current_price
-                    self.positions[ticker] += shares_bought
-                    self.cash -= trade_value
-            elif trade_value < 0:  # sell
-                shares_to_sell = min(-trade_value / current_price, self.positions[ticker])
-                self.positions[ticker] -= shares_to_sell
-                self.cash += shares_to_sell * current_price
-
-        prev_value = total_value
-
-        self.current_step += 1
-        done = (self.current_step >= self.max_steps - 1)
-        # New portfolio value
-        new_value = self.cash + sum(
-            self.positions[ticker] * self.data[ticker].iloc[self.current_step]['Close'] 
-            for ticker in self.tickers
-        )
-        # Reward is the change in portfolio value
-        reward = new_value - prev_value
-        next_state = self._get_state()
-        return next_state, reward, done, {}
+        self.num_stocks = stock_prices.shape[1]
+        self.current_step = 0
+        
+        # Action: allocation vector (continuous values); agent must output vector that sums to 1.
+        self.action_space = gym.spaces.Box(low=0, high=1, shape=(self.num_stocks,), dtype=np.float32)
+        # Observation: concatenation of current prices and holdings.
+        obs_low = np.zeros(self.num_stocks * 2, dtype=np.float32)
+        obs_high = np.full(self.num_stocks * 2, np.inf, dtype=np.float32)
+        self.observation_space = gym.spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
+        self.initialized = False
 
     def reset(self):
-        self.current_step = 0
         self.cash = self.initial_cash
-        self.positions = {ticker: 0.0 for ticker in self.tickers}
-        return self._get_state()
-
-# ------------------------
-# Replay Buffer
-# ------------------------
-class ReplayBuffer(object):
-    def __init__(self, state_dim, action_dim, max_size=int(1e6)):
-        self.max_size = max_size
-        self.ptr = 0
-        self.size = 0
-
-        self.state = np.zeros((max_size, state_dim))
-        self.action = np.zeros((max_size, action_dim))
-        self.next_state = np.zeros((max_size, state_dim))
-        self.reward = np.zeros((max_size, 1))
-        self.not_done = np.zeros((max_size, 1))
-
-    def add(self, state, action, next_state, reward, done):
-        self.state[self.ptr] = state
-        self.action[self.ptr] = action
-        self.next_state[self.ptr] = next_state
-        self.reward[self.ptr] = reward
-        self.not_done[self.ptr] = 1. - done
-
-        self.ptr = (self.ptr + 1) % self.max_size
-        self.size = min(self.size + 1, self.max_size)
-
-    def sample(self, batch_size):
-        ind = np.random.randint(0, self.size, size=batch_size)
-        return (
-            torch.FloatTensor(self.state[ind]),
-            torch.FloatTensor(self.action[ind]),
-            torch.FloatTensor(self.next_state[ind]),
-            torch.FloatTensor(self.reward[ind]),
-            torch.FloatTensor(self.not_done[ind])
-        )
-
-# ------------------------
-# BCQ Agent Components (Actor, Critic, VAE)
-# ------------------------
-class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, max_action, phi=0.05):
-        super(Actor, self).__init__()
-        self.l1 = nn.Linear(state_dim + action_dim, 400)
-        self.l2 = nn.Linear(400, 300)
-        self.l3 = nn.Linear(300, action_dim)
+        self.holdings = np.zeros(self.num_stocks)  # no stocks initially
+        self.current_step = 0
+        self.initialized = False
+        return self._get_obs()
+    
+    def _get_obs(self):
+        current_prices = self.stock_prices[self.current_step]
+        return np.concatenate([current_prices, self.holdings])
+    
+    def step(self, action):
+        """
+        At time 0, use the action (allocation vector) to invest all cash.
+        Afterwards, no trading (i.e. no selling) is allowed.
+        """
+        if self.current_step == 0 and not self.initialized:
+            # Normalize allocation so it sums to 1.
+            allocation = np.array(action) / np.sum(action)
+            current_prices = self.stock_prices[self.current_step]
+            # Buy shares: number of shares = (cash * allocation) / price.
+            self.holdings = (self.cash * allocation) / current_prices
+            self.cash = 0
+            self.initialized = True
+            reward = 0  # No reward on initial purchase.
+        else:
+            # In this simple version, no further trading is allowed.
+            reward = 0
         
-        self.max_action = max_action
-        self.phi = phi
+        self.current_step += 1
+        done = self.current_step >= len(self.stock_prices)
+        obs = self._get_obs()
+        info = {}
+        return obs, reward, done, info
 
-    def forward(self, state, action):
-        a = F.relu(self.l1(torch.cat([state, action], 1)))
-        a = F.relu(self.l2(a))
-        a = self.phi * self.max_action * torch.tanh(self.l3(a))
-        return (a + action).clamp(-self.max_action, self.max_action)
+    def render(self, mode="human"):
+        current_prices = self.stock_prices[self.current_step - 1]
+        portfolio_value = self.cash + np.sum(self.holdings * current_prices)
+        print(f"Step: {self.current_step} | Portfolio Value: ${portfolio_value:.2f}")
 
-class Critic(nn.Module):
+# --------------------------
+# Replay Buffer
+# --------------------------
+Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state', 'done'))
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+    
+    def push(self, *args):
+        self.buffer.append(Transition(*args))
+    
+    def sample(self, batch_size):
+        transitions = random.sample(self.buffer, batch_size)
+        return Transition(*zip(*transitions))
+    
+    def __len__(self):
+        return len(self.buffer)
+
+# --------------------------
+# BCQ Networks
+# --------------------------
+# Q-network: takes state and action, outputs Q-value.
+class QNetwork(nn.Module):
     def __init__(self, state_dim, action_dim):
-        super(Critic, self).__init__()
-        # Q1 architecture
-        self.l1 = nn.Linear(state_dim + action_dim, 400)
-        self.l2 = nn.Linear(400, 300)
-        self.l3 = nn.Linear(300, 1)
-        # Q2 architecture
-        self.l4 = nn.Linear(state_dim + action_dim, 400)
-        self.l5 = nn.Linear(400, 300)
-        self.l6 = nn.Linear(300, 1)
-
+        super(QNetwork, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_dim + action_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256,256),
+            nn.ReLU(),
+            nn.Linear(256,1)
+        )
     def forward(self, state, action):
-        q1 = F.relu(self.l1(torch.cat([state, action], 1)))
-        q1 = F.relu(self.l2(q1))
-        q1 = self.l3(q1)
+        x = torch.cat([state, action], dim=1)
+        return self.net(x)
 
-        q2 = F.relu(self.l4(torch.cat([state, action], 1)))
-        q2 = F.relu(self.l5(q2))
-        q2 = self.l6(q2)
-        return q1, q2
-
-    def q1(self, state, action):
-        q1 = F.relu(self.l1(torch.cat([state, action], 1)))
-        q1 = F.relu(self.l2(q1))
-        q1 = self.l3(q1)
-        return q1
-
-# Variational Auto-Encoder to generate actions close to those in the data
+# VAE network: learns to reconstruct actions given state-action pairs.
 class VAE(nn.Module):
-    def __init__(self, state_dim, action_dim, latent_dim, max_action, device):
+    def __init__(self, state_dim, action_dim, latent_dim=10):
         super(VAE, self).__init__()
-        self.e1 = nn.Linear(state_dim + action_dim, 750)
-        self.e2 = nn.Linear(750, 750)
-
-        self.mean = nn.Linear(750, latent_dim)
-        self.log_std = nn.Linear(750, latent_dim)
-
-        self.d1 = nn.Linear(state_dim + latent_dim, 750)
-        self.d2 = nn.Linear(750, 750)
-        self.d3 = nn.Linear(750, action_dim)
-
-        self.max_action = max_action
+        self.e1 = nn.Linear(state_dim + action_dim, 256)
+        self.e2 = nn.Linear(256, 256)
+        self.mean = nn.Linear(256, latent_dim)
+        self.log_std = nn.Linear(256, latent_dim)
+        self.d1 = nn.Linear(state_dim + latent_dim, 256)
+        self.d2 = nn.Linear(256, 256)
+        self.d3 = nn.Linear(256, action_dim)
         self.latent_dim = latent_dim
-        self.device = device
 
     def forward(self, state, action):
-        z = F.relu(self.e1(torch.cat([state, action], 1)))
-        z = F.relu(self.e2(z))
-
-        mean = self.mean(z)
-        # Clamped for numerical stability
-        log_std = self.log_std(z).clamp(-4, 15)
+        x = torch.cat([state, action], dim=1)
+        x = torch.relu(self.e1(x))
+        x = torch.relu(self.e2(x))
+        mean = self.mean(x)
+        log_std = self.log_std(x).clamp(-4, 15)
         std = torch.exp(log_std)
         z = mean + std * torch.randn_like(std)
-        
-        u = self.decode(state, z)
-        return u, mean, std
+        x = torch.cat([state, z], dim=1)
+        x = torch.relu(self.d1(x))
+        x = torch.relu(self.d2(x))
+        action_recon = torch.tanh(self.d3(x))
+        return action_recon, mean, std
 
     def decode(self, state, z=None):
-        # When sampling from the VAE, sample a latent vector if none provided
+        batch_size = state.size(0)
         if z is None:
-            z = torch.randn((state.shape[0], self.latent_dim)).to(self.device).clamp(-0.5,0.5)
-        a = F.relu(self.d1(torch.cat([state, z], 1)))
-        a = F.relu(self.d2(a))
-        return self.max_action * torch.tanh(self.d3(a))
+            z = torch.randn(batch_size, self.latent_dim).to(state.device).clamp(-0.5,0.5)
+        x = torch.cat([state, z], dim=1)
+        x = torch.relu(self.d1(x))
+        x = torch.relu(self.d2(x))
+        action = torch.tanh(self.d3(x))
+        return action
 
-# ------------------------
+# Perturbation network: given state and action, outputs a small adjustment (delta).
+class Perturbation(nn.Module):
+    def __init__(self, state_dim, action_dim, phi=0.05):
+        super(Perturbation, self).__init__()
+        self.phi = phi
+        self.net = nn.Sequential(
+            nn.Linear(state_dim + action_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, action_dim),
+            nn.Tanh()
+        )
+    def forward(self, state, action):
+        delta = self.phi * self.net(torch.cat([state, action], dim=1))
+        return delta
+
+# --------------------------
 # BCQ Agent
-# ------------------------
-class BCQ(object):
-    def __init__(self, state_dim, action_dim, max_action, device, discount=0.99, tau=0.005, lmbda=0.75, phi=0.05):
-        latent_dim = action_dim * 2
-
-        self.actor = Actor(state_dim, action_dim, max_action, phi).to(device)
-        self.actor_target = copy.deepcopy(self.actor)
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=1e-3)
-
-        self.critic = Critic(state_dim, action_dim).to(device)
-        self.critic_target = copy.deepcopy(self.critic)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=1e-3)
-
-        self.vae = VAE(state_dim, action_dim, latent_dim, max_action, device).to(device)
-        self.vae_optimizer = optim.Adam(self.vae.parameters())
-
-        self.max_action = max_action
+# --------------------------
+class BCQAgent:
+    def __init__(self, state_dim, action_dim, device, discount=0.99, tau=0.005, lmbda=0.75):
+        self.state_dim = state_dim
         self.action_dim = action_dim
+        self.device = device
         self.discount = discount
         self.tau = tau
         self.lmbda = lmbda
-        self.device = device
 
+        self.q_network = QNetwork(state_dim, action_dim).to(device)
+        self.q_target = QNetwork(state_dim, action_dim).to(device)
+        self.q_target.load_state_dict(self.q_network.state_dict())
+        self.q_optimizer = optim.Adam(self.q_network.parameters())
+
+        self.vae = VAE(state_dim, action_dim).to(device)
+        self.vae_optimizer = optim.Adam(self.vae.parameters())
+
+        self.perturbation = Perturbation(state_dim, action_dim).to(device)
+        self.perturbation_optimizer = optim.Adam(self.perturbation.parameters())
+    
     def select_action(self, state):
-        # Select action by sampling multiple candidate actions and choosing the best one according to Q
-        state = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
+        state_tensor = torch.FloatTensor(state).to(self.device).unsqueeze(0)
         with torch.no_grad():
-            state_repeat = state.repeat(100, 1)
+            num_samples = 10
+            state_repeat = state_tensor.repeat(num_samples, 1)
             action_samples = self.vae.decode(state_repeat)
-            perturbed_actions = self.actor(state_repeat, action_samples)
-            q1 = self.critic.q1(state_repeat, perturbed_actions)
-            ind = q1.argmax(0)
-        return perturbed_actions[ind].cpu().data.numpy().flatten()
+            perturbed_actions = action_samples + self.perturbation(state_repeat, action_samples)
+            q_values = self.q_network(state_repeat, perturbed_actions)
+            best_index = q_values.argmax()
+            best_action = perturbed_actions[best_index].cpu().numpy()
+        # Map network output (assumed in [-1,1]) to [0,1] and normalize to sum to 1.
+        best_action = (best_action + 1) / 2
+        best_action = best_action / best_action.sum()
+        return best_action
 
-    def train(self, replay_buffer, iterations, batch_size=100):
-        for it in range(iterations):
-            # Sample replay buffer
-            state, action, next_state, reward, not_done = replay_buffer.sample(batch_size)
+    def train(self, replay_buffer, batch_size=64):
+        batch = replay_buffer.sample(batch_size)
+        state = torch.FloatTensor(np.array(batch.state)).to(self.device)
+        action = torch.FloatTensor(np.array(batch.action)).to(self.device)
+        reward = torch.FloatTensor(np.array(batch.reward)).to(self.device).unsqueeze(1)
+        next_state = torch.FloatTensor(np.array(batch.next_state)).to(self.device)
+        done = torch.FloatTensor(np.array(batch.done)).to(self.device).unsqueeze(1)
 
-            # VAE Training
-            recon, mean, std = self.vae(state, action)
-            recon_loss = F.mse_loss(recon, action)
-            KL_loss = -0.5 * (1 + torch.log(std.pow(2)) - mean.pow(2) - std.pow(2)).mean()
-            vae_loss = recon_loss + 0.5 * KL_loss
+        # VAE update: reconstruction and KL loss.
+        recon, mean, std = self.vae(state, action)
+        recon_loss = nn.MSELoss()(recon, action)
+        kl_loss = (-0.5 * torch.sum(1 + torch.log(std**2) - mean**2 - std**2, dim=1)).mean()
+        vae_loss = recon_loss + 0.5 * kl_loss
+        self.vae_optimizer.zero_grad()
+        vae_loss.backward()
+        self.vae_optimizer.step()
 
-            self.vae_optimizer.zero_grad()
-            vae_loss.backward()
-            self.vae_optimizer.step()
+        # Q-network update.
+        with torch.no_grad():
+            num_samples = 10
+            next_state_repeat = next_state.repeat(num_samples, 1)
+            next_action_samples = self.vae.decode(next_state_repeat)
+            next_action_samples = next_action_samples + self.perturbation(next_state_repeat, next_action_samples)
+            q_values = self.q_target(next_state_repeat, next_action_samples)
+            q_values = q_values.view(num_samples, batch_size, 1)
+            max_q = q_values.max(0)[0]
+            target_q = reward + (1 - done) * self.discount * max_q
 
-            # Critic Training
-            with torch.no_grad():
-                # Duplicate next state 10 times for action sampling
-                next_state_rep = next_state.repeat_interleave(10, 0)
-                next_action = self.vae.decode(next_state_rep)
-                next_action = self.actor_target(next_state_rep, next_action)
-                target_Q1, target_Q2 = self.critic_target(next_state_rep, next_action)
-                target_Q = self.lmbda * torch.min(target_Q1, target_Q2) + (1. - self.lmbda) * torch.max(target_Q1, target_Q2)
-                target_Q = target_Q.reshape(batch_size, -1).max(1)[0].reshape(-1, 1)
-                target_Q = reward + not_done * self.discount * target_Q
+        current_q = self.q_network(state, action)
+        q_loss = nn.MSELoss()(current_q, target_q)
+        self.q_optimizer.zero_grad()
+        q_loss.backward()
+        self.q_optimizer.step()
 
-            current_Q1, current_Q2 = self.critic(state, action)
-            critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
+        # Perturbation network update.
+        perturbed_actions = self.vae.decode(state)
+        perturbed_actions = perturbed_actions + self.perturbation(state, perturbed_actions)
+        perturb_loss = -self.q_network(state, perturbed_actions).mean()
+        self.perturbation_optimizer.zero_grad()
+        perturb_loss.backward()
+        self.perturbation_optimizer.step()
 
-            self.critic_optimizer.zero_grad()
-            critic_loss.backward()
-            self.critic_optimizer.step()
+        # Soft update target Q-network.
+        for param, target_param in zip(self.q_network.parameters(), self.q_target.parameters()):
+            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-            # Actor Training
-            sampled_actions = self.vae.decode(state)
-            perturbed_actions = self.actor(state, sampled_actions)
-            actor_loss = -self.critic.q1(state, perturbed_actions).mean()
-            
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
-
-            # Update Target Networks
-            for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
-                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-
-# ------------------------
-# Training Loop
-# ------------------------
-def train_agent(env, agent, replay_buffer, episodes=100, max_timesteps=200, batch_size=100, start_timesteps=1000):
-    total_timesteps = 0
-    for episode in range(episodes):
-        state = env.reset()
-        episode_reward = 0
-        for t in range(max_timesteps):
-            total_timesteps += 1
-            # Use random action until the replay buffer is filled sufficiently
-            if total_timesteps < start_timesteps:
-                action = env.action_space.sample()
-            else:
-                action = agent.select_action(np.array(state))
-            next_state, reward, done, _ = env.step(action)
-            replay_buffer.add(state, action, next_state, reward, done)
-            state = next_state
-            episode_reward += reward
-
-            if total_timesteps >= start_timesteps:
-                agent.train(replay_buffer, iterations=1, batch_size=batch_size)
-
-            if done:
-                break
-        print(f"Episode {episode}: Reward {episode_reward:.2f}")
-
-# ------------------------
-# Main: Setup Environment, Agent, and Start Training
-# ------------------------
-if __name__ == "__main__":
+# --------------------------
+# Main Training Loop
+# --------------------------
+def main():
+    # Create a simulated market: 3 stocks over T time steps.
+    T = 200
+    num_stocks = 3
+    np.random.seed(42)
+    base_prices = np.array([100, 50, 20])
+    price_changes = np.random.normal(0, 1, size=(T, num_stocks))
+    stock_prices = np.maximum(base_prices + np.cumsum(price_changes, axis=0), 1)
+    
+    env = TradingEnv(stock_prices, initial_cash=10000)
+    state = env.reset()
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    state_dim = env.observation_space.shape[0]  # prices + holdings
+    action_dim = env.action_space.shape[0]        # allocation vector
     
-    # For demonstration we use a few tickers. Replace with a full S&P500 list as needed.
-    tickers = ["AAPL", "MSFT", "GOOGL"]
-    start_date = "2020-01-01"
-    end_date = "2021-01-01"
-    env = StockTradingEnv(tickers, start_date, end_date)
+    agent = BCQAgent(state_dim, action_dim, device)
+    replay_buffer = ReplayBuffer(100000)
     
-    state_dim = env.observation_dim
-    action_dim = env.action_dim
-    max_action = 1.0  # Actions in [-1,1]
+    num_episodes = 1000
+    batch_size = 64
+    episode_rewards = []
     
-    agent = BCQ(state_dim, action_dim, max_action, device)
-    replay_buffer = ReplayBuffer(state_dim, action_dim)
+    for episode in range(num_episodes):
+        state = env.reset()
+        done = False
+        total_reward = 0  # In this simple setup, reward is always 0.
+        while not done:
+            # Use BCQ agent to select an action.
+            action = agent.select_action(state)
+            next_state, reward, done, _ = env.step(action)
+            replay_buffer.push(state, action, reward, next_state, done)
+            state = next_state
+            total_reward += reward
+        episode_rewards.append(total_reward)
+        
+        # Train the agent if enough samples have been collected.
+        if len(replay_buffer) > batch_size:
+            for _ in range(50):
+                agent.train(replay_buffer, batch_size)
+        
+        if (episode + 1) % 100 == 0:
+            print(f"Episode {episode+1}/{num_episodes} - Total Reward: {total_reward}")
     
-    # Train for a set number of episodes (adjust episodes and timesteps as needed)
-    train_agent(env, agent, replay_buffer, episodes=50, max_timesteps=env.max_steps)
+    # Plot episode rewards (note: rewards are zero in this example as reward function is not defined).
+    plt.plot(episode_rewards)
+    plt.xlabel("Episode")
+    plt.ylabel("Total Reward")
+    plt.title("BCQ Training on Trading Environment")
+    plt.show()
+
+if __name__ == "__main__":
+    main()
