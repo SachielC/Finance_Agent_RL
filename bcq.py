@@ -53,7 +53,7 @@ class StockTradingEnv(gym.Env):
                         for ticker in self.tickers)
 
         # Convert action to weights with temperature
-        weights = F.softmax(torch.tensor(action) * (1.0 + 0.1 * np.random.randn())  # Add noise
+        weights = F.softmax(torch.tensor(action) * (1.0 + 0.1 * np.random.randn()))  # Add noise
         weights = weights.numpy()
         weights /= weights.sum()
 
