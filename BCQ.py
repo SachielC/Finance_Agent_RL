@@ -9,6 +9,18 @@ import matplotlib.pyplot as plt
 import yfinance as yf
 import pandas as pd
 
+snp500_data = None
+
+def fetch_snp500_data(start='2005-01-01', end='2025-04-14'):  # TODO: make this dynamic
+    global snp500_data
+    snp500_data = yf.download('^GSPC', start=start, end=end)
+    print("S&P 500 data loaded.")
+
+def get_close_prices():
+    global snp500_data
+    if snp500_data is not None:
+        return snp500_data['Close']
+
 # --------------------------
 # Trading Environment
 # --------------------------
@@ -27,24 +39,35 @@ class TradingEnv(gym.Env):
     - Debug logs print the day number, portfolio value, and cash balance.
     """
     def __init__(self, stock_prices, dividends, initial_cash=10000):
+        self.start_date = "2005-01-01"  # TODO: make this dynamic
+        self.end_date = "2024-12-31"    # TODO: make this dynamic
         super().__init__()
-        self.stock_prices = stock_prices  # shape: (T, num_stocks)
+        self.stock_prices = stock_prices  
         self.dividends = dividends
         self.initial_cash = initial_cash
         self.num_stocks = stock_prices.shape[1]
         self.current_step = 0
         
-        # Updated action: now expecting (num_stocks + 1) allocations (stocks + cash).
+        # Fetch and process S&P 500 close prices
+        fetch_snp500_data(self.start_date, self.end_date)
+        snp_close = get_close_prices()
+        if snp_close is not None:
+            # Convert to NumPy array for easy integer indexing.
+            self.snp500_close_prices = snp_close.values  
+        else:
+            self.snp500_close_prices = np.array([])
+
         self.action_space = gym.spaces.Box(low=0, high=1, shape=(self.num_stocks + 1,), dtype=np.float32)
-        # Updated observation: prices, holdings for stocks, and cash amount.
         obs_low = np.zeros(self.num_stocks * 2 + 1, dtype=np.float32)
         obs_high = np.full(self.num_stocks * 2 + 1, np.inf, dtype=np.float32)
         self.observation_space = gym.spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
 
     def reset(self):
         self.current_step = 0
+        self.days_passed = 0  # Initialize days passed for use in step(), probably can use self.current_step instead.
         current_prices = self.stock_prices[self.current_step]
-        # Start with equal allocation in stocks and no cash.
+        
+        # Start with equal allocation in stocks and no cash, changeable but this is the current format
         allocation = np.full(self.num_stocks, 1.0 / self.num_stocks)
         self.cash = 0.0  # All cash is used initially to buy stocks.
         self.holdings = (allocation * self.initial_cash) / current_prices
@@ -57,6 +80,15 @@ class TradingEnv(gym.Env):
         current_prices = self.stock_prices[self.current_step]
         return np.concatenate([current_prices, self.holdings, [self.cash]])
 
+    def get_reward(self, next, now):
+        # Reward is the change in portfolio value.
+        growth = next - now
+        # Use integer indexing on the NumPy array of S&P 500 close prices.
+        snp_growth = self.snp500_close_prices[self.current_step] / self.snp500_close_prices[0]
+        offset_value = growth - self.initial_cash
+        reward = offset_value - snp_growth
+        return reward
+    
     def step(self, action):
         # Expecting action vector of size num_stocks + 1; first num_stocks for stocks and last for cash.
         assert len(action) == self.num_stocks + 1, "Action must include allocation for all stocks plus cash."
@@ -80,10 +112,10 @@ class TradingEnv(gym.Env):
 
         # Compute reward using next day's prices.
         next_step = self.current_step + 1
-        next_prices = self.stock_prices[next_step]  # assumes there is a next day; done will handle terminal
+        next_prices = self.stock_prices[next_step]  # Assumes there is a next day.
         next_stock_value = np.sum(new_holdings * next_prices)
         next_total_value = next_stock_value + new_cash
-        reward = next_total_value - total_value
+        reward = self.get_reward(next_total_value, total_value)
 
         # Update state.
         self.holdings = new_holdings
@@ -91,11 +123,10 @@ class TradingEnv(gym.Env):
         self.current_step = next_step
         done = self.current_step >= len(self.stock_prices) - 1
         obs = self._get_obs()
-
+        self.days_passed += 1
         return obs, reward, done, {}
 
     def render(self, mode="human"):
-        # Render uses the previous day's prices (to show the rebalanced portfolio).
         current_prices = self.stock_prices[self.current_step - 1]
         portfolio_value = self.cash + np.sum(self.holdings * current_prices)
         print(f"Day {self.current_step} - Portfolio Value: ${portfolio_value:.2f}, Cash: ${self.cash:.2f}")
@@ -300,7 +331,7 @@ if __name__ == "__main__":
     
     # Stock tickers and data download
     tickers = ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "JPM", "JNJ", "V", "PG", "MA",
-                "NVDA", "UNH", "HD", "DIS", "BAC", "PFE", "CMCSA", "VZ", "ADBE", "NFLX"]
+               "NVDA", "UNH", "HD", "DIS", "BAC", "PFE", "CMCSA", "VZ", "ADBE", "NFLX"]
     dividends = {}
     for item in tickers:
         ticker_obj = yf.Ticker(item)
@@ -350,23 +381,20 @@ if __name__ == "__main__":
                 print(f"Episode {episode} finishing early")
                 break
         
-        # Record results
+        # Record results for each episode.
         final_prices = env.stock_prices[-1]
         portfolio_value = env.cash + np.sum(env.holdings * final_prices)
         episode_rewards.append(total_reward)
         portfolio_values.append(portfolio_value)
         
-        # Print progress
+        # Print progress (if needed)
         if episode % print_interval == 0:
             print(f"Episode {episode}/{num_episodes} - "
                   f"Reward: ${total_reward:.2f} - "
                   f"Portfolio Value: ${portfolio_value:.2f} - "
                   f"Cash: ${env.cash:.2f}")
     
-    # Training complete
     print("\nTraining completed!")
-    
-    # Final episode summary
     print("\n===== Final Training Episode Summary =====")
     initial_portfolio_value = 10000.00
     final_portfolio_value = portfolio_values[-1]
@@ -379,38 +407,39 @@ if __name__ == "__main__":
     
     print("Stock Breakdown:")
     for i, ticker in enumerate(tickers):
-        initial_stock_value = (10000 / env.num_stocks)  # equally distributed initial cash
+        initial_stock_value = (10000 / env.num_stocks)
         final_stock_value = env.holdings[i] * final_prices[i]
         change = final_stock_value - initial_stock_value
         print(f"{ticker}: Initial ${initial_stock_value:.2f}, Final ${final_stock_value:.2f}, Change ${change:.2f}")
-
     print(f"Cash at End: ${env.cash:.2f}")
 
-    # Plot results
+    # Plot overall episode performance (Portfolio Value and Rewards over Episodes)
     plt.figure(figsize=(12, 6))
-    
-    # Plot portfolio values
     plt.subplot(1, 2, 1)
-    plt.plot(portfolio_values)
+    plt.plot(portfolio_values, label="Portfolio Value", color="blue")
     plt.xlabel("Episode")
     plt.ylabel("Portfolio Value ($)")
     plt.title("Portfolio Value Over Episodes")
-    
-    # Plot rewards
+    plt.grid(True)
+
     plt.subplot(1, 2, 2)
-    plt.plot(episode_rewards)
+    plt.plot(episode_rewards, label="Reward", color="orange")
     plt.xlabel("Episode")
     plt.ylabel("Total Reward ($)")
     plt.title("Rewards Over Episodes")
-    
+    plt.grid(True)
     plt.tight_layout()
     plt.show() 
 
     # --------------------------
-    # Plot daily performance of final episode
+    # Plot daily performance of final episode with Cash Graph and individual Stock Graphs
     # --------------------------
-    print("\nPlotting portfolio value over the last episode...")
-    daily_values = []
+    print("\nPlotting portfolio value, cash holdings, and individual stock values over the last episode...")
+
+    daily_values = []        # total portfolio value (cash + stock values)
+    daily_cash = []          # cash-only values
+    daily_stock_values = [[] for _ in range(env.num_stocks)]  # one list per stock
+
     state = env.reset()
     done = False
 
@@ -419,14 +448,39 @@ if __name__ == "__main__":
         next_state, reward, done, _ = env.step(action)
         state = next_state
         current_prices = env.stock_prices[env.current_step - 1]
-        daily_value = env.cash + np.sum(env.holdings * current_prices)
-        daily_values.append(daily_value)
+        
+        # Calculate total portfolio value for the day.
+        portfolio_value = env.cash + np.sum(env.holdings * current_prices)
+        daily_values.append(portfolio_value)
+        
+        # Record cash holdings.
+        daily_cash.append(env.cash)
+        
+        # Record each stock's current dollar value (shares * price).
+        for i in range(env.num_stocks):
+            stock_value = env.holdings[i] * current_prices[i]
+            daily_stock_values[i].append(stock_value)
 
+    # Plot portfolio value and cash holdings on the same graph.
     plt.figure(figsize=(10, 5))
-    plt.plot(daily_values)
+    plt.plot(daily_values, label="Portfolio Value", color="blue")
+    plt.plot(daily_cash, label="Cash Holdings", color="green")
     plt.xlabel("Day")
-    plt.ylabel("Portfolio Value ($)")
-    plt.title("Final Episode: Daily Portfolio Value")
+    plt.ylabel("Value ($)")
+    plt.title("Final Episode: Portfolio Value and Cash Holdings Over Time")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # Plot individual stock values on a separate graph (one line per stock).
+    plt.figure(figsize=(12, 6))
+    for i in range(env.num_stocks):
+        plt.plot(daily_stock_values[i], label=f"{tickers[i]}")
+    plt.xlabel("Day")
+    plt.ylabel("Stock Dollar Value ($)")
+    plt.title("Final Episode: Individual Stock Values Over Time")
+    plt.legend(loc="upper left", bbox_to_anchor=(1.05, 1), ncol=1)
     plt.grid(True)
     plt.tight_layout()
     plt.show()
