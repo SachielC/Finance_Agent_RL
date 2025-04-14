@@ -7,6 +7,7 @@ import random
 from collections import deque, namedtuple
 import matplotlib.pyplot as plt
 import yfinance as yf
+import pandas as pd
 
 # --------------------------
 # Trading Environment
@@ -14,91 +15,87 @@ import yfinance as yf
 class TradingEnv(gym.Env):
     """
     Trading environment with daily rebalancing and debug logs.
-
+    
     - Starts with $10,000 equally invested in 20 stocks.
     - Uses daily closing prices from yfinance.
-    - At each step, the agent supplies a target allocation (vector that sums to 1).
-      The environment rebalances by selling shares where the target is lower than
-      current holdings and buying where it is higher.
+    - At each step, the agent supplies a target allocation vector (length=num_stocks+1) 
+      that sums to 1. The first num_stocks entries specify target allocation for stocks,
+      and the last entry specifies allocation for cash.
+    - The environment rebalances by selling or buying stocks according to the target.
     - The portfolio value is updated every day according to the current closing prices.
-    - Reward is computed as the current portfolio value minus the starting cash ($10,000),
-      representing the pure increase in portfolio value.
-    - Debug logs print the day number, actions taken, portfolio value, and cash balance.
+    - Reward is computed as the increase in portfolio value over the day.
+    - Debug logs print the day number, portfolio value, and cash balance.
     """
-    def __init__(self, stock_prices, initial_cash=10000):
+    def __init__(self, stock_prices, dividends, initial_cash=10000):
         super().__init__()
         self.stock_prices = stock_prices  # shape: (T, num_stocks)
+        self.dividends = dividends
         self.initial_cash = initial_cash
         self.num_stocks = stock_prices.shape[1]
         self.current_step = 0
-
-        # Action: allocation vector (continuous values) that should sum to 1.
-        self.action_space = gym.spaces.Box(low=0, high=1, shape=(self.num_stocks,), dtype=np.float32)
-        # Observation: concatenation of current prices and current holdings.
-        obs_low = np.zeros(self.num_stocks * 2, dtype=np.float32)
-        obs_high = np.full(self.num_stocks * 2, np.inf, dtype=np.float32)
+        
+        # Updated action: now expecting (num_stocks + 1) allocations (stocks + cash).
+        self.action_space = gym.spaces.Box(low=0, high=1, shape=(self.num_stocks + 1,), dtype=np.float32)
+        # Updated observation: prices, holdings for stocks, and cash amount.
+        obs_low = np.zeros(self.num_stocks * 2 + 1, dtype=np.float32)
+        obs_high = np.full(self.num_stocks * 2 + 1, np.inf, dtype=np.float32)
         self.observation_space = gym.spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
 
     def reset(self):
         self.current_step = 0
         current_prices = self.stock_prices[self.current_step]
-
-        # Distribute initial cash equally among stocks
+        # Start with equal allocation in stocks and no cash.
         allocation = np.full(self.num_stocks, 1.0 / self.num_stocks)
-        self.cash = self.initial_cash
-        self.holdings = (allocation * self.cash) / current_prices
-        self.cash = 0.0  # All cash is used to buy stocks
-
+        self.cash = 0.0  # All cash is used initially to buy stocks.
+        self.holdings = (allocation * self.initial_cash) / current_prices
         self.cost_basis = current_prices.copy()
         self.sold_profit = 0.0
-        return np.concatenate([current_prices, self.holdings])
-    
+        return self._get_obs()
+
     def _get_obs(self):
+        # Observation includes current prices, current holdings, and available cash.
         current_prices = self.stock_prices[self.current_step]
-        return np.concatenate([current_prices, self.holdings])
+        return np.concatenate([current_prices, self.holdings, [self.cash]])
+
     def step(self, action):
+        # Expecting action vector of size num_stocks + 1; first num_stocks for stocks and last for cash.
+        assert len(action) == self.num_stocks + 1, "Action must include allocation for all stocks plus cash."
+        
+        # Ensure valid probability distribution.
+        action = np.clip(action, 1e-6, None)
+        action /= np.sum(action)
+
+        # Get current prices.
         current_prices = self.stock_prices[self.current_step]
-        portfolio_value = self.cash + np.sum(self.holdings * current_prices)
 
-        # Normalize action so that it sums to 1
-        allocation = np.array(action) / np.sum(action)
-        target_value = portfolio_value * allocation
-        target_shares = target_value / current_prices
+        # Compute current portfolio value.
+        stock_values = self.holdings * current_prices
+        stock_total = np.sum(stock_values)
+        total_value = stock_total + self.cash
 
-        # Rebalance portfolio while ensuring no negative holdings
-        for i in range(self.num_stocks):
-            delta = target_shares[i] - self.holdings[i]
-            if delta < 0:  # Sell shares
-                shares_to_sell = min(-delta, self.holdings[i])  # Prevent selling more than owned
-                sale_amount = shares_to_sell * current_prices[i]
-                realized_profit = (current_prices[i] - self.cost_basis[i]) * shares_to_sell
-                self.holdings[i] -= shares_to_sell
-                self.cash += sale_amount
-                self.sold_profit += realized_profit
-            elif delta > 0:  # Buy shares if cash available
-                cost = delta * current_prices[i]
-                if cost > self.cash:
-                    delta = self.cash / current_prices[i]
-                    cost = delta * current_prices[i]
-                if self.holdings[i] > 0:
-                    self.cost_basis[i] = ((self.cost_basis[i] * self.holdings[i]) + (current_prices[i] * delta)) / (self.holdings[i] + delta)
-                else:
-                    self.cost_basis[i] = current_prices[i]
-                self.holdings[i] += delta
-                self.cash -= cost
+        # Rebalance portfolio according to target allocation.
+        target_stock_value = action[:-1] * total_value
+        new_holdings = target_stock_value / current_prices  # new shares for each stock
+        new_cash = action[-1] * total_value
 
-        # Compute new portfolio value
-        new_prices = self.stock_prices[self.current_step]
-        portfolio_value = self.cash + np.sum(self.holdings * new_prices)
+        # Compute reward using next day's prices.
+        next_step = self.current_step + 1
+        next_prices = self.stock_prices[next_step]  # assumes there is a next day; done will handle terminal
+        next_stock_value = np.sum(new_holdings * next_prices)
+        next_total_value = next_stock_value + new_cash
+        reward = next_total_value - total_value
 
-        # Reward is portfolio increase over the initial investment
-        reward = portfolio_value - self.initial_cash
+        # Update state.
+        self.holdings = new_holdings
+        self.cash = new_cash
+        self.current_step = next_step
+        done = self.current_step >= len(self.stock_prices) - 1
+        obs = self._get_obs()
 
-        self.current_step += 1
-        done = self.current_step >= len(self.stock_prices)
-        obs = self._get_obs() if not done else np.concatenate([self.stock_prices[-1], self.holdings])
         return obs, reward, done, {}
+
     def render(self, mode="human"):
+        # Render uses the previous day's prices (to show the rebalanced portfolio).
         current_prices = self.stock_prices[self.current_step - 1]
         portfolio_value = self.cash + np.sum(self.holdings * current_prices)
         print(f"Day {self.current_step} - Portfolio Value: ${portfolio_value:.2f}, Cash: ${self.cash:.2f}")
@@ -111,11 +108,14 @@ Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state'
 class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
+    
     def push(self, *args):
         self.buffer.append(Transition(*args))
+    
     def sample(self, batch_size):
         transitions = random.sample(self.buffer, batch_size)
         return Transition(*zip(*transitions))
+    
     def __len__(self):
         return len(self.buffer)
 
@@ -133,6 +133,7 @@ class QNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 1)
         )
+    
     def forward(self, state, action):
         x = torch.cat([state, action], dim=1)
         return self.net(x)
@@ -149,6 +150,7 @@ class VAE(nn.Module):
         self.d2 = nn.Linear(256, 256)
         self.d3 = nn.Linear(256, action_dim)
         self.latent_dim = latent_dim
+    
     def forward(self, state, action):
         x = torch.cat([state, action], dim=1)
         x = torch.relu(self.e1(x))
@@ -162,6 +164,7 @@ class VAE(nn.Module):
         x = torch.relu(self.d2(x))
         action_recon = torch.tanh(self.d3(x))
         return action_recon, mean, std
+    
     def decode(self, state, z=None):
         batch_size = state.size(0)
         if z is None:
@@ -183,6 +186,7 @@ class Perturbation(nn.Module):
             nn.Linear(256, action_dim),
             nn.Tanh()
         )
+    
     def forward(self, state, action):
         delta = self.phi * self.net(torch.cat([state, action], dim=1))
         return delta
@@ -202,13 +206,15 @@ class BCQAgent:
         self.q_network = QNetwork(state_dim, action_dim).to(device)
         self.q_target = QNetwork(state_dim, action_dim).to(device)
         self.q_target.load_state_dict(self.q_network.state_dict())
-        self.q_optimizer = optim.Adam(self.q_network.parameters())
+        self.q_optimizer = optim.Adam(self.q_network.parameters(), lr=1e-3)
 
         self.vae = VAE(state_dim, action_dim).to(device)
-        self.vae_optimizer = optim.Adam(self.vae.parameters())
+        self.vae_optimizer = optim.Adam(self.vae.parameters(), lr=1e-3)
 
         self.perturbation = Perturbation(state_dim, action_dim).to(device)
-        self.perturbation_optimizer = optim.Adam(self.perturbation.parameters())
+        self.perturbation_optimizer = optim.Adam(self.perturbation.parameters(), lr=1e-3)
+        
+        self.replay_buffer = ReplayBuffer(100000)
     
     def select_action(self, state):
         state_tensor = torch.FloatTensor(state).to(self.device).unsqueeze(0)
@@ -216,17 +222,21 @@ class BCQAgent:
             num_samples = 10
             state_repeat = state_tensor.repeat(num_samples, 1)
             action_samples = self.vae.decode(state_repeat)
+            # Apply perturbation and select the best action based on Q-value.
             perturbed_actions = action_samples + self.perturbation(state_repeat, action_samples)
             q_values = self.q_network(state_repeat, perturbed_actions)
             best_index = q_values.argmax()
             best_action = perturbed_actions[best_index].cpu().numpy()
-        # Map output from [-1,1] to [0,1] and normalize.
+        # Map from [-1, 1] to [0, 1] and normalize so that the allocation sums to 1.
         best_action = (best_action + 1) / 2
         best_action = best_action / best_action.sum()
         return best_action
 
-    def train(self, replay_buffer, batch_size=64):
-        batch = replay_buffer.sample(batch_size)
+    def train(self, batch_size=64):
+        if len(self.replay_buffer) < batch_size:
+            return
+        
+        batch = self.replay_buffer.sample(batch_size)
         state = torch.FloatTensor(np.array(batch.state)).to(self.device)
         action = torch.FloatTensor(np.array(batch.action)).to(self.device)
         reward = torch.FloatTensor(np.array(batch.reward)).to(self.device).unsqueeze(1)
@@ -274,44 +284,92 @@ class BCQAgent:
 # --------------------------
 # Main Training Loop
 # --------------------------
-
-
 if __name__ == "__main__":
-    tickers = ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "JPM", "JNJ", "V", "PG", "MA",
-               "NVDA", "UNH", "HD", "DIS", "BAC", "PFE", "CMCSA", "VZ", "ADBE", "NFLX"]
+    # Set random seeds for reproducibility
+    start = "2005-01-01"
+    end = "2024-12-31"
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
     
-    data = yf.download(tickers, start="2015-01-01", end="2022-12-31")["Close"]
+    # Device configuration: use GPU if available
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+    
+    # Stock tickers and data download
+    tickers = ["AAPL", "MSFT", "AMZN", "GOOGL", "META", "JPM", "JNJ", "V", "PG", "MA",
+                "NVDA", "UNH", "HD", "DIS", "BAC", "PFE", "CMCSA", "VZ", "ADBE", "NFLX"]
+    dividends = {}
+    for item in tickers:
+        ticker_obj = yf.Ticker(item)
+        dividends[item] = pd.Series(ticker_obj.dividends[start:end].values.astype(np.float32)).fillna(method='ffill')
+    print("Downloading stock data...")
+    data = yf.download(tickers, start=start, end=end)["Close"]
     data = data.fillna(method='ffill').fillna(method='bfill')
     stock_prices = data.values.astype(np.float32)
-
-    env = TradingEnv(stock_prices, initial_cash=10000)
-    state = env.reset()
-
-    num_episodes = 100
+    
+    # Create environment
+    env = TradingEnv(stock_prices, dividends, initial_cash=10000)
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.shape[0]
+    
+    # Initialize BCQ agent
+    agent = BCQAgent(state_dim, action_dim, device)
+    
+    # Training parameters
+    num_episodes = 10
+    batch_size = 32
+    print_interval = 50
     episode_rewards = []
-
-    for episode in range(num_episodes):
+    portfolio_values = []
+    
+    print("Starting training...")
+    for episode in range(1, num_episodes + 1):
         state = env.reset()
         done = False
         total_reward = 0.0
-
+        
         while not done:
-            action = np.random.rand(env.num_stocks)  # Placeholder for RL agent action
-            action = action / action.sum()  # Ensure it sums to 1
+            # Select and execute action
+            action = agent.select_action(state)
             next_state, reward, done, _ = env.step(action)
+            
+            # Store transition in replay buffer
+            agent.replay_buffer.push(state, action, reward, next_state, done)
+            
+            # Train the agent
+            agent.train(batch_size)
+            
             state = next_state
             total_reward += reward
-
+            
+            # Optional: stop early for debugging
+            if env.current_step == 2000:
+                print(f"Episode {episode} finishing early")
+                break
+        
+        # Record results
         final_prices = env.stock_prices[-1]
         portfolio_value = env.cash + np.sum(env.holdings * final_prices)
         episode_rewards.append(total_reward)
-
-        print(f"Episode {episode+1} End: Portfolio Value = ${portfolio_value:.2f}, Cash = ${env.cash:.2f}")
-
+        portfolio_values.append(portfolio_value)
+        
+        # Print progress
+        if episode % print_interval == 0:
+            print(f"Episode {episode}/{num_episodes} - "
+                  f"Reward: ${total_reward:.2f} - "
+                  f"Portfolio Value: ${portfolio_value:.2f} - "
+                  f"Cash: ${env.cash:.2f}")
+    
+    # Training complete
+    print("\nTraining completed!")
+    
     # Final episode summary
     print("\n===== Final Training Episode Summary =====")
     initial_portfolio_value = 10000.00
-    final_portfolio_value = env.cash + np.sum(env.holdings * final_prices)
+    final_portfolio_value = portfolio_values[-1]
     total_change = final_portfolio_value - initial_portfolio_value
     percentage_change = (total_change / initial_portfolio_value) * 100
 
@@ -321,16 +379,54 @@ if __name__ == "__main__":
     
     print("Stock Breakdown:")
     for i, ticker in enumerate(tickers):
-        initial_stock_value = (10000 / env.num_stocks)  # Initial cash divided equally among stocks
+        initial_stock_value = (10000 / env.num_stocks)  # equally distributed initial cash
         final_stock_value = env.holdings[i] * final_prices[i]
         change = final_stock_value - initial_stock_value
         print(f"{ticker}: Initial ${initial_stock_value:.2f}, Final ${final_stock_value:.2f}, Change ${change:.2f}")
 
     print(f"Cash at End: ${env.cash:.2f}")
 
+    # Plot results
+    plt.figure(figsize=(12, 6))
+    
+    # Plot portfolio values
+    plt.subplot(1, 2, 1)
+    plt.plot(portfolio_values)
+    plt.xlabel("Episode")
+    plt.ylabel("Portfolio Value ($)")
+    plt.title("Portfolio Value Over Episodes")
+    
     # Plot rewards
+    plt.subplot(1, 2, 2)
     plt.plot(episode_rewards)
     plt.xlabel("Episode")
-    plt.ylabel("Total Reward (Portfolio Increase)")
-    plt.title("BCQ Training on Trading Environment (2015-2022)")
+    plt.ylabel("Total Reward ($)")
+    plt.title("Rewards Over Episodes")
+    
+    plt.tight_layout()
+    plt.show() 
+
+    # --------------------------
+    # Plot daily performance of final episode
+    # --------------------------
+    print("\nPlotting portfolio value over the last episode...")
+    daily_values = []
+    state = env.reset()
+    done = False
+
+    while not done:
+        action = agent.select_action(state)
+        next_state, reward, done, _ = env.step(action)
+        state = next_state
+        current_prices = env.stock_prices[env.current_step - 1]
+        daily_value = env.cash + np.sum(env.holdings * current_prices)
+        daily_values.append(daily_value)
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(daily_values)
+    plt.xlabel("Day")
+    plt.ylabel("Portfolio Value ($)")
+    plt.title("Final Episode: Daily Portfolio Value")
+    plt.grid(True)
+    plt.tight_layout()
     plt.show()
