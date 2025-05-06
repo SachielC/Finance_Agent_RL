@@ -62,8 +62,6 @@ Lastly, beyond RL, we will test traditional supervised learning models to compar
 * **Yahoo Finance**  
   * Library downloadable into python (yfinance)  
   * Includes stock data as well as Dividends. Those are reported intermittently but basic data cleaning can allow the dataset to look backwards .  
-* **Bloomberg Terminal?**  
-  * Have to figure out how it works, may be useful?
 
 ### **Evaluation Metrics**
 
